@@ -1040,6 +1040,17 @@ static int asus_ec_probe(struct platform_device *pdev)
 			ec->profile_cached = EC_PROFILE_STANDARD;
 	}
 
+	/*
+	 * Profile sysfs disabled on A14: register (0x01,0x0b) is read-only;
+	 * writes via eccw(0x01,0x8b,n) succeed but produce no state change.
+	 * Profile appears firmware-controlled (may require ACPI method or is
+	 * baked into thermal tables). Vivobook opcode 0x24/0x76 also NACK on A14.
+	 * TODO: investigate ACPI WMI methods or Windows driver behavior.
+	 */
+	dev_info(dev, "profile read-only (fw-controlled); current=%s\n",
+		 profile_names[ec->profile_cached]);
+
+	/* Uncomment when A14 profile write protocol is discovered:
 	ret = devm_device_add_group(dev, &asus_ec_profile_group);
 	if (ret)
 		dev_warn(dev,
@@ -1049,6 +1060,7 @@ static int asus_ec_probe(struct platform_device *pdev)
 		dev_info(dev,
 			 "profile sysfs registered (current=%s)\n",
 			 profile_names[ec->profile_cached]);
+	*/
 
 	return 0;
 }
