@@ -5,20 +5,32 @@ Out-of-tree Linux kernel driver (PoC) for the Embedded Controller of the
 
 ## Status
 
-**Step 1 scaffold.** The module loads, finds the I²C adapter behind the
-platform device `b94000.i2c`, instantiates two `i2c_client`s at the EC
-address (`0x5b`) and the companion fan-controller address (`0x76`), and
-exits cleanly on `rmmod`. **No EC I/O is performed yet.**
+**Step 5.** Driver registers a `hwmon` device with writable PWM control,
+runs an EC-temperature watchdog kthread when in manual fan mode, handles
+suspend/resume safely, and exposes `platform_profile` (quiet / balanced /
+balanced-performance / performance).
+
+### Exposed interfaces
+
+| sysfs                                    | semantics                              |
+|------------------------------------------|----------------------------------------|
+| `hwmon/hwmonN/fan1_input`                | RPM (tach × 88, calibrated)            |
+| `hwmon/hwmonN/pwm1`                      | 0-255 (RW; only takes effect manual)   |
+| `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW)              |
+| `hwmon/hwmonN/temp1_input`               | EC thermistor, m°C                     |
+| `firmware/acpi/platform_profile`         | quiet/balanced/.../performance         |
+| `firmware/acpi/platform_profile_choices` | quiet, balanced, balanced-performance, performance |
 
 ## Roadmap
 
 1. ✅ Scaffold (probe/remove, adapter lookup, client instantiation)
-2. EC protocol layer (`ec_settle`, `ecrb`/`ecwb`/`eccr`/`eccw`) with mutex
-3. `hwmon` registration: `fan1_input`, `pwm1`, `pwm1_enable`, `temp1`
-4. (Later) `platform_profile` integration → KDE Energy Saving dropdown
-5. (Later) Temperature watchdog kthread (required for safe `mode auto`)
-6. (Later) Keyboard backlight LED class
-7. (Later) Proper DT bindings for upstream submission
+2. ✅ EC protocol layer (`ec_settle`, `ecrb`/`ecwb`/`eccr`/`eccw`) with mutex
+3. ✅ `hwmon` registration: `fan1_input`, `pwm1`, `pwm1_enable`, `temp1`
+4. ✅ Writable PWM + temperature-watchdog kthread + suspend/resume PM ops
+5. ✅ `platform_profile` integration (KDE Energy Saving dropdown)
+6. (Later) Keyboard backlight LED class — blocked on protocol RE
+7. (Later) DKMS packaging
+8. (Later) Proper DT bindings for upstream submission
 
 ## Build
 
@@ -44,15 +56,23 @@ make dmesg    # tail driver log lines
 
 ## Safety
 
-- The driver is intentionally read-only of the bus until step 2 lands.
-- All EC writes will go through a per-device mutex once added.
-- Companion `i2c-tools` user-space access on `/dev/i2c-4` will be **mutually
-  exclusive** with this driver; either use `tool.py` *or* this module, not
-  both.
-- If anything misbehaves: hard power-cycle the laptop and pick the working
-  kernel from the bootloader. The module is out-of-tree and never
-  installed to `/lib/modules/.../extra/` unless you run `make install`
-  (not provided).
+- **EC watchdog**: when `pwm1_enable=1` (manual), a kthread feeds the EC
+  the max SoC thermal-zone temperature every 2s. If this stream stops
+  for ~2 minutes the EC will hard-reset the box. The driver:
+  - sends one temp synchronously **before** flipping to manual
+  - sets EC back to auto **before** stopping the kthread
+  - forces auto + stops kthread on `rmmod` and on suspend
+  - restores manual on resume only after restarting the kthread
+- Companion `i2c-tools` / `tool.py` user-space access on `/dev/i2c-4` is
+  **mutually exclusive** with this driver — either use the userspace
+  tool *or* this module, not both.
+- Profile-set protocol is the documented Vivobook approach
+  (`Request(0x76).write(0x24, idx)`). The driver verifies via the
+  `eccr(0x01, 0x0b)` readback hypothesis on every set — see source.
+- If anything misbehaves: hard power-cycle the laptop and pick the
+  working kernel from the bootloader. The module is out-of-tree and
+  never installed to `/lib/modules/.../extra/` unless you run
+  `make install` (not provided).
 
 ## License
 

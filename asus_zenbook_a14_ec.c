@@ -2,7 +2,7 @@
 /*
  * ASUS Zenbook A14 (UX3407RA) Embedded Controller driver — PoC
  *
- * Step 4: writable fan control + EC temperature watchdog.
+ * Step 5: platform_profile (low-power / balanced / performance).
  *
  *   fan1_input   eccr(0x01, 0x09) × 88        RPM (calibrated)
  *   fan1_label   "fan"
@@ -47,6 +47,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/platform_profile.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
 #include <linux/thermal.h>
@@ -97,6 +98,21 @@
 /* Fan-controller (0x76) opcodes (mirrors x1e-ec-tool/tool.py) */
 #define FAN_OP_PUSH_TEMP	0x20	/* [0x20, 0x01, 0x02, lo, hi] */
 #define FAN_OP_SUSPEND		0x23	/* [0x23, mode] */
+#define FAN_OP_PROFILE		0x24	/* [0x24, profile_idx]; Vivobook proto */
+
+/* Profile readback hypothesis: eccr(0x01, 0x0b) returns current idx
+ * (0..3). Validated empirically on Zenbook A14 by writing via 0x24
+ * and observing the readback. See system-snapshot.md.
+ */
+#define EC_REG_PROFILE_MAJ	0x01
+#define EC_REG_PROFILE_RMIN	0x0b
+
+/* EC profile indices (matches MODELS["ASUS Vivobook S 15"].profiles) */
+#define EC_PROFILE_WHISPER	0
+#define EC_PROFILE_STANDARD	1
+#define EC_PROFILE_PERFORMANCE	2
+#define EC_PROFILE_FULL_SPEED	3
+#define EC_PROFILE_MAX		3
 
 /* Watchdog: must be well below the EC's ~2 min timeout. */
 #define WATCHDOG_PERIOD_MS	2000
@@ -124,6 +140,10 @@ struct asus_ec {
 	bool			manual_active;
 	struct thermal_zone_device *zones[ASUS_EC_MAX_ZONES];
 	int			n_zones;
+
+	/* Platform profile state */
+	struct device		*ppdev;
+	u8			profile_cached;	/* last value we wrote */
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -361,6 +381,123 @@ static int fan_set_suspend(struct asus_ec *ec, u8 mode)
 	ret = i2c_master_send(ec->fan_client, buf, sizeof(buf));
 	return ret < 0 ? ret : 0;
 }
+
+static int fan_set_profile(struct asus_ec *ec, u8 profile)
+{
+	u8 buf[2] = { FAN_OP_PROFILE, profile };
+	int ret;
+
+	if (profile > EC_PROFILE_MAX)
+		return -EINVAL;
+
+	ret = i2c_master_send(ec->fan_client, buf, sizeof(buf));
+	return ret < 0 ? ret : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Platform profile                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Two protocol hypotheses for setting the profile on the X1E80100 EC:
+ *   (a) tool.py / Vivobook: Request(0x76).write(0x24, idx)   ← used here
+ *   (b) +0x80 convention:    eccw(0x01, 0x8b, idx)            ← unverified
+ *
+ * (a) is the documented vendor approach and is known to work on the
+ * sibling Vivobook S 15. (b) is hypothesised because eccr(0x01, 0x0b)
+ * returns 0x02 by default on the A14, matching "Performance" idx 2.
+ *
+ * We pick (a) and *verify* it by reading back 0x0b after every set:
+ * if the readback tracks the written value, both hypotheses are
+ * consistent with each other (probably (b) is just the underlying
+ * register write that 0x24 performs).
+ */
+
+static const u8 profile_to_ec[PLATFORM_PROFILE_LAST] = {
+	[PLATFORM_PROFILE_LOW_POWER]		= EC_PROFILE_WHISPER,
+	[PLATFORM_PROFILE_QUIET]		= EC_PROFILE_WHISPER,
+	[PLATFORM_PROFILE_BALANCED]		= EC_PROFILE_STANDARD,
+	[PLATFORM_PROFILE_BALANCED_PERFORMANCE]	= EC_PROFILE_PERFORMANCE,
+	[PLATFORM_PROFILE_PERFORMANCE]		= EC_PROFILE_FULL_SPEED,
+};
+
+static enum platform_profile_option ec_to_profile(u8 v)
+{
+	switch (v) {
+	case EC_PROFILE_WHISPER:	return PLATFORM_PROFILE_QUIET;
+	case EC_PROFILE_STANDARD:	return PLATFORM_PROFILE_BALANCED;
+	case EC_PROFILE_PERFORMANCE:	return PLATFORM_PROFILE_BALANCED_PERFORMANCE;
+	case EC_PROFILE_FULL_SPEED:	return PLATFORM_PROFILE_PERFORMANCE;
+	default:			return PLATFORM_PROFILE_BALANCED;
+	}
+}
+
+static int asus_ec_profile_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_QUIET, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
+static int asus_ec_profile_get(struct device *dev,
+			       enum platform_profile_option *profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	u8 v;
+	int ret;
+
+	ret = asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
+			       EC_REG_PROFILE_RMIN, &v);
+	if (ret || v > EC_PROFILE_MAX) {
+		/* Fall back to whatever we last set. */
+		v = ec->profile_cached;
+	}
+
+	*profile = ec_to_profile(v);
+	return 0;
+}
+
+static int asus_ec_profile_set(struct device *dev,
+			       enum platform_profile_option profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	u8 idx;
+	u8 readback;
+	int ret;
+
+	if (profile >= PLATFORM_PROFILE_LAST)
+		return -EINVAL;
+	idx = profile_to_ec[profile];
+	if (idx > EC_PROFILE_MAX)
+		return -EOPNOTSUPP;
+
+	ret = fan_set_profile(ec, idx);
+	if (ret) {
+		dev_err(dev, "profile_set(%u) failed: %d\n", idx, ret);
+		return ret;
+	}
+	ec->profile_cached = idx;
+
+	/* Verify the (0x01, 0x0b) readback hypothesis. Best-effort. */
+	if (!asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
+			      EC_REG_PROFILE_RMIN, &readback)) {
+		if (readback != idx)
+			dev_dbg(dev,
+				"profile readback (0x%02x) != written (0x%02x)\n",
+				readback, idx);
+	}
+
+	dev_dbg(dev, "profile set to %u\n", idx);
+	return 0;
+}
+
+static const struct platform_profile_ops asus_ec_profile_ops = {
+	.probe		= asus_ec_profile_probe,
+	.profile_get	= asus_ec_profile_get,
+	.profile_set	= asus_ec_profile_set,
+};
 
 /* ------------------------------------------------------------------ */
 /* Thermal zone bookkeeping + watchdog                                */
@@ -852,6 +989,32 @@ static int asus_ec_probe(struct platform_device *pdev)
 	}
 
 	dev_info(dev, "hwmon registered\n");
+
+	/* Initialise profile cache from EC readback (best-effort). */
+	{
+		u8 v;
+
+		if (!asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
+				      EC_REG_PROFILE_RMIN, &v) &&
+		    v <= EC_PROFILE_MAX)
+			ec->profile_cached = v;
+		else
+			ec->profile_cached = EC_PROFILE_STANDARD;
+	}
+
+	ec->ppdev = devm_platform_profile_register(dev, DRV_NAME, ec,
+						   &asus_ec_profile_ops);
+	if (IS_ERR(ec->ppdev)) {
+		ret = PTR_ERR(ec->ppdev);
+		dev_warn(dev,
+			 "platform_profile registration failed: %d (continuing)\n",
+			 ret);
+		ec->ppdev = NULL;
+	} else {
+		dev_info(dev, "platform_profile registered (current=%u)\n",
+			 ec->profile_cached);
+	}
+
 	return 0;
 }
 
