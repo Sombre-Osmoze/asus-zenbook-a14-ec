@@ -47,6 +47,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/platform_profile.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
 #include <linux/thermal.h>
@@ -146,6 +147,8 @@ struct asus_ec {
 	 * platform device. Userspace tooling can bridge to PPD later.
 	 */
 	u8			profile_cached;	/* last value we wrote */
+	struct device		*ppdev;		/* platform_profile class device */
+	enum platform_profile_option pp_active;	/* currently active profile */
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -535,6 +538,90 @@ static struct attribute *asus_ec_profile_attrs[] = {
 
 static const struct attribute_group asus_ec_profile_group = {
 	.attrs = asus_ec_profile_attrs,
+};
+
+/* ------------------------------------------------------------------ */
+/* platform_profile integration                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Since the A14 EC profile register (0x01,0x0b) is read-only and the
+ * Vivobook protocol (0x24/0x76) NACKs, we implement platform_profile
+ * by controlling the fan directly:
+ *   QUIET        → auto mode (EC manages conservatively)
+ *   BALANCED     → auto mode (EC default thermal curve)
+ *   PERFORMANCE  → manual mode, PWM 180 (~2400 RPM sustained cooling)
+ */
+
+#define PP_PERF_PWM	180
+
+static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_QUIET, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
+static int asus_ec_pp_get(struct device *dev,
+			  enum platform_profile_option *profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+
+	*profile = ec->pp_active;
+	return 0;
+}
+
+static int asus_ec_pp_set(struct device *dev,
+			  enum platform_profile_option profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&ec->mode_lock);
+
+	switch (profile) {
+	case PLATFORM_PROFILE_QUIET:
+	case PLATFORM_PROFILE_BALANCED:
+		/* Both use auto mode — EC handles the thermal curve. */
+		if (ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
+			if (ret)
+				goto out;
+			ec->manual_active = false;
+		}
+		break;
+
+	case PLATFORM_PROFILE_PERFORMANCE:
+		/* Manual mode with fixed high PWM for sustained cooling. */
+		if (!ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+			if (ret)
+				goto out;
+			ec->manual_active = true;
+		}
+		ret = asus_ec_set_pwm(ec, PP_PERF_PWM);
+		if (ret)
+			goto out;
+		break;
+
+	default:
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ec->pp_active = profile;
+	ret = 0;
+
+out:
+	mutex_unlock(&ec->mode_lock);
+	return ret;
+}
+
+static const struct platform_profile_ops asus_ec_pp_ops = {
+	.probe       = asus_ec_pp_probe,
+	.profile_get = asus_ec_pp_get,
+	.profile_set = asus_ec_pp_set,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1067,6 +1154,20 @@ static int asus_ec_probe(struct platform_device *pdev)
 			 "profile sysfs registered (current=%s)\n",
 			 profile_names[ec->profile_cached]);
 	*/
+
+	/* Register platform_profile — maps profiles to fan PWM control.
+	 * PPD will auto-discover via /sys/class/platform-profile/.
+	 */
+	ec->pp_active = PLATFORM_PROFILE_BALANCED;
+	ec->ppdev = devm_platform_profile_register(dev,
+				"asus-zenbook-a14-ec", ec, &asus_ec_pp_ops);
+	if (IS_ERR(ec->ppdev)) {
+		dev_warn(dev, "platform_profile registration failed: %ld (continuing)\n",
+			 PTR_ERR(ec->ppdev));
+		ec->ppdev = NULL;
+	} else {
+		dev_info(dev, "platform_profile registered (quiet/balanced/performance)\n");
+	}
 
 	return 0;
 }
