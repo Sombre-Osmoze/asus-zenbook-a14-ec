@@ -29,7 +29,7 @@ unload:
 	sudo rmmod asus_zenbook_a14_ec
 
 reload:
-	-sudo rmmod asus_zenbook_a14_ec 2>/dev/null
+	-sudo rmmod asus_zenbook_a14_ec
 	sudo insmod ./asus_zenbook_a14_ec.ko
 
 dmesg:

@@ -47,7 +47,6 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/platform_profile.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
 #include <linux/thermal.h>
@@ -141,8 +140,11 @@ struct asus_ec {
 	struct thermal_zone_device *zones[ASUS_EC_MAX_ZONES];
 	int			n_zones;
 
-	/* Platform profile state */
-	struct device		*ppdev;
+	/* Profile state. ACPI's platform_profile framework requires
+	 * acpi_kobj which doesn't exist on DT-only ARM64 systems, so we
+	 * expose a compatible interface as our own sysfs group on the
+	 * platform device. Userspace tooling can bridge to PPD later.
+	 */
 	u8			profile_cached;	/* last value we wrote */
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
@@ -395,7 +397,7 @@ static int fan_set_profile(struct asus_ec *ec, u8 profile)
 }
 
 /* ------------------------------------------------------------------ */
-/* Platform profile                                                   */
+/* Profile sysfs (custom; mirrors platform_profile string semantics)  */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -411,71 +413,60 @@ static int fan_set_profile(struct asus_ec *ec, u8 profile)
  * if the readback tracks the written value, both hypotheses are
  * consistent with each other (probably (b) is just the underlying
  * register write that 0x24 performs).
+ *
+ * The kernel's platform_profile framework would normally own the
+ * /sys/firmware/acpi/platform_profile sysfs node, but it requires
+ * ACPI (acpi_disabled check + acpi_kobj as sysfs root). This box
+ * is DT-only, so we expose the same string vocabulary as a custom
+ * sysfs group on our platform device:
+ *
+ *   /sys/devices/platform/asus_zenbook_a14_ec/profile
+ *   /sys/devices/platform/asus_zenbook_a14_ec/profile_choices
+ *
+ * Once a non-ACPI platform_profile path lands upstream (or once we
+ * patch it ourselves), this whole block becomes a thin wrapper
+ * around devm_platform_profile_register().
  */
 
-static const u8 profile_to_ec[PLATFORM_PROFILE_LAST] = {
-	[PLATFORM_PROFILE_LOW_POWER]		= EC_PROFILE_WHISPER,
-	[PLATFORM_PROFILE_QUIET]		= EC_PROFILE_WHISPER,
-	[PLATFORM_PROFILE_BALANCED]		= EC_PROFILE_STANDARD,
-	[PLATFORM_PROFILE_BALANCED_PERFORMANCE]	= EC_PROFILE_PERFORMANCE,
-	[PLATFORM_PROFILE_PERFORMANCE]		= EC_PROFILE_FULL_SPEED,
+static const char * const profile_names[] = {
+	[EC_PROFILE_WHISPER]	 = "quiet",
+	[EC_PROFILE_STANDARD]	 = "balanced",
+	[EC_PROFILE_PERFORMANCE] = "balanced-performance",
+	[EC_PROFILE_FULL_SPEED]	 = "performance",
 };
 
-static enum platform_profile_option ec_to_profile(u8 v)
+static int profile_name_to_idx(const char *name, size_t len)
 {
-	switch (v) {
-	case EC_PROFILE_WHISPER:	return PLATFORM_PROFILE_QUIET;
-	case EC_PROFILE_STANDARD:	return PLATFORM_PROFILE_BALANCED;
-	case EC_PROFILE_PERFORMANCE:	return PLATFORM_PROFILE_BALANCED_PERFORMANCE;
-	case EC_PROFILE_FULL_SPEED:	return PLATFORM_PROFILE_PERFORMANCE;
-	default:			return PLATFORM_PROFILE_BALANCED;
+	int i;
+
+	/* Strip trailing whitespace/newline. */
+	while (len && (name[len - 1] == '\n' || name[len - 1] == ' ' ||
+		       name[len - 1] == '\t'))
+		len--;
+
+	/* Allow numeric "0".."3" too, for scripts. */
+	if (len == 1 && name[0] >= '0' && name[0] <= '3')
+		return name[0] - '0';
+
+	for (i = 0; i < ARRAY_SIZE(profile_names); i++) {
+		if (strlen(profile_names[i]) == len &&
+		    !strncmp(profile_names[i], name, len))
+			return i;
 	}
+	return -EINVAL;
 }
 
-static int asus_ec_profile_probe(void *drvdata, unsigned long *choices)
+static int asus_ec_profile_apply(struct asus_ec *ec, u8 idx)
 {
-	set_bit(PLATFORM_PROFILE_QUIET, choices);
-	set_bit(PLATFORM_PROFILE_BALANCED, choices);
-	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
-	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
-	return 0;
-}
-
-static int asus_ec_profile_get(struct device *dev,
-			       enum platform_profile_option *profile)
-{
-	struct asus_ec *ec = dev_get_drvdata(dev);
-	u8 v;
-	int ret;
-
-	ret = asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
-			       EC_REG_PROFILE_RMIN, &v);
-	if (ret || v > EC_PROFILE_MAX) {
-		/* Fall back to whatever we last set. */
-		v = ec->profile_cached;
-	}
-
-	*profile = ec_to_profile(v);
-	return 0;
-}
-
-static int asus_ec_profile_set(struct device *dev,
-			       enum platform_profile_option profile)
-{
-	struct asus_ec *ec = dev_get_drvdata(dev);
-	u8 idx;
 	u8 readback;
 	int ret;
 
-	if (profile >= PLATFORM_PROFILE_LAST)
-		return -EINVAL;
-	idx = profile_to_ec[profile];
 	if (idx > EC_PROFILE_MAX)
-		return -EOPNOTSUPP;
+		return -EINVAL;
 
 	ret = fan_set_profile(ec, idx);
 	if (ret) {
-		dev_err(dev, "profile_set(%u) failed: %d\n", idx, ret);
+		dev_err(ec->dev, "profile_set(%u) failed: %d\n", idx, ret);
 		return ret;
 	}
 	ec->profile_cached = idx;
@@ -484,19 +475,66 @@ static int asus_ec_profile_set(struct device *dev,
 	if (!asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
 			      EC_REG_PROFILE_RMIN, &readback)) {
 		if (readback != idx)
-			dev_dbg(dev,
+			dev_dbg(ec->dev,
 				"profile readback (0x%02x) != written (0x%02x)\n",
 				readback, idx);
 	}
 
-	dev_dbg(dev, "profile set to %u\n", idx);
+	dev_dbg(ec->dev, "profile set to %u (%s)\n",
+		idx, profile_names[idx]);
 	return 0;
 }
 
-static const struct platform_profile_ops asus_ec_profile_ops = {
-	.probe		= asus_ec_profile_probe,
-	.profile_get	= asus_ec_profile_get,
-	.profile_set	= asus_ec_profile_set,
+static ssize_t profile_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	u8 v;
+
+	if (asus_ec_read_reg(ec, EC_REG_PROFILE_MAJ,
+			     EC_REG_PROFILE_RMIN, &v) || v > EC_PROFILE_MAX)
+		v = ec->profile_cached;
+
+	return sysfs_emit(buf, "%s\n", profile_names[v]);
+}
+
+static ssize_t profile_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	int idx = profile_name_to_idx(buf, count);
+	int ret;
+
+	if (idx < 0)
+		return idx;
+
+	ret = asus_ec_profile_apply(ec, (u8)idx);
+	return ret ? ret : count;
+}
+
+static ssize_t profile_choices_show(struct device *dev,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	return sysfs_emit(buf, "%s %s %s %s\n",
+			  profile_names[EC_PROFILE_WHISPER],
+			  profile_names[EC_PROFILE_STANDARD],
+			  profile_names[EC_PROFILE_PERFORMANCE],
+			  profile_names[EC_PROFILE_FULL_SPEED]);
+}
+
+static DEVICE_ATTR_RW(profile);
+static DEVICE_ATTR_RO(profile_choices);
+
+static struct attribute *asus_ec_profile_attrs[] = {
+	&dev_attr_profile.attr,
+	&dev_attr_profile_choices.attr,
+	NULL,
+};
+
+static const struct attribute_group asus_ec_profile_group = {
+	.attrs = asus_ec_profile_attrs,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1002,18 +1040,15 @@ static int asus_ec_probe(struct platform_device *pdev)
 			ec->profile_cached = EC_PROFILE_STANDARD;
 	}
 
-	ec->ppdev = devm_platform_profile_register(dev, DRV_NAME, ec,
-						   &asus_ec_profile_ops);
-	if (IS_ERR(ec->ppdev)) {
-		ret = PTR_ERR(ec->ppdev);
+	ret = devm_device_add_group(dev, &asus_ec_profile_group);
+	if (ret)
 		dev_warn(dev,
-			 "platform_profile registration failed: %d (continuing)\n",
+			 "profile sysfs registration failed: %d (continuing)\n",
 			 ret);
-		ec->ppdev = NULL;
-	} else {
-		dev_info(dev, "platform_profile registered (current=%u)\n",
-			 ec->profile_cached);
-	}
+	else
+		dev_info(dev,
+			 "profile sysfs registered (current=%s)\n",
+			 profile_names[ec->profile_cached]);
 
 	return 0;
 }

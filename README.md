@@ -18,8 +18,17 @@ balanced-performance / performance).
 | `hwmon/hwmonN/pwm1`                      | 0-255 (RW; only takes effect manual)   |
 | `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW)              |
 | `hwmon/hwmonN/temp1_input`               | EC thermistor, m°C                     |
-| `firmware/acpi/platform_profile`         | quiet/balanced/.../performance         |
-| `firmware/acpi/platform_profile_choices` | quiet, balanced, balanced-performance, performance |
+| `/sys/devices/platform/asus_zenbook_a14_ec/profile`         | RW: quiet/balanced/balanced-performance/performance |
+| `/sys/devices/platform/asus_zenbook_a14_ec/profile_choices` | RO: space-separated list               |
+
+> **Profile interface note**: the kernel's `platform_profile` framework
+> requires ACPI (`acpi_disabled` check + `acpi_kobj` sysfs root) and is
+> therefore unusable on DT-based ARM64. We expose the same string
+> vocabulary as a custom sysfs group on the platform device. KDE
+> PowerDevil's "Power Profile" dropdown will not pick this up natively
+> — use the sysfs path directly or write a small bridge to PPD. Once a
+> non-ACPI `platform_profile` lands upstream, this swaps to a one-liner
+> `devm_platform_profile_register()` call.
 
 ## Roadmap
 
