@@ -2,9 +2,19 @@
 /*
  * ASUS Zenbook A14 (UX3407RA) Embedded Controller driver — PoC
  *
- * Step 2: EC protocol layer (mutex-protected) + one read-only debug
- * sysfs attribute (`ec_battery`) that reads EC register (0x03, 0x01)
- * to cross-check against /sys/class/power_supply/qcom-battmgr-bat/capacity.
+ * Step 3: hwmon registration.
+ *
+ *   fan1_input   eccr(0x01, 0x09) × 88        RPM (calibrated)
+ *   fan1_label   "fan"
+ *   pwm1         eccr(0x01, 0x0a)             0-255 (RO in this step)
+ *   pwm1_enable  eccr(0x01, 0x02) → mapped    1=manual, 2=auto (RO)
+ *   temp1_input  eccr(0x05, 0x02) × 1000      m°C
+ *   temp1_label  "ec"
+ *
+ * pwm1 / pwm1_enable are read-only here. Writing PWM (and switching
+ * pwm1_enable to manual) is a Step 4 change once the temp-watchdog
+ * kthread is in place — without it, the EC will hard-reset the system
+ * if temp reporting stops.
  *
  * Hardware details (see system-snapshot.md):
  *  - SoC: Qualcomm X1E80100
@@ -15,16 +25,15 @@
  *  - ecrb(maj, min)        : raw register read (1 byte)
  *  - ecwb(maj, min, val)   : raw register write (1 byte)
  *  - ec_settle()           : wait for register (0xc4, 0x30) == 0
- *  - eccr(a1, a2)          : compound read (atomic-exchange semantics:
- *                             returns previous (0xc4, 0x32),
- *                             writes (0xc4, 0x32) into target a1/a2)
+ *  - eccr(a1, a2)          : compound read with atomic-exchange semantics
  *  - eccw(a1, a2, val)     : compound write
  *
- * Copyright (C) 2026 osmoze
+ * Copyright (C) 2026 Sombre-Osmoze <sombre@osmoze.xyz>
  */
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/hwmon.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -32,7 +41,6 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/sysfs.h>
 
 #define DRV_NAME		"asus_zenbook_a14_ec"
 
@@ -41,27 +49,42 @@
 #define FAN_I2C_ADDR		0x76
 
 /* EC protocol opcodes */
-#define EC_OP_ADDR		0x10	/* prefix: write [0x10, maj, min]	*/
-#define EC_OP_DATA		0x11	/* prefix: write [0x11(, val)] / read 1	*/
+#define EC_OP_ADDR		0x10
+#define EC_OP_DATA		0x11
 
 /* Compound-op mailboxes at major 0xc4 */
-#define EC_CC_BUSY		0x30	/* (0xc4, 0x30): poll == 0 to settle	*/
-#define EC_CC_REGSEL		0x31	/* (0xc4, 0x31): a2 mailbox		*/
-#define EC_CC_DATA		0x32	/* (0xc4, 0x32): payload mailbox	*/
+#define EC_CC_BUSY		0x30
+#define EC_CC_REGSEL		0x31
+#define EC_CC_DATA		0x32
 
-/* Settle loop: poll (0xc4, 0x30) until 0; ~50ms / iter, 2s cap. */
 #define EC_SETTLE_INTERVAL_US	50000
 #define EC_SETTLE_TIMEOUT_MS	2000
 
-/* Probe register: battery percent. Safe to read; matches power_supply.	*/
-#define EC_REG_BATTERY_MAJ	0x03
-#define EC_REG_BATTERY_MIN	0x01
+/* hwmon-exposed registers (validated during EC investigation) */
+#define EC_REG_FAN_MODE_MAJ	0x01
+#define EC_REG_FAN_MODE_MIN	0x02	/* 0=auto, 2=manual */
+#define EC_REG_FAN_TACH_MAJ	0x01
+#define EC_REG_FAN_TACH_MIN	0x09	/* RPM = value × 88 */
+#define EC_REG_PWM_MAJ		0x01
+#define EC_REG_PWM_MIN		0x0a	/* 0-255 */
+#define EC_REG_TEMP_MAJ		0x05
+#define EC_REG_TEMP_MIN		0x02	/* °C */
+
+/* Tach-to-RPM conversion: empirically RPM ≈ tach × 88
+ * (audio FFT calibration, system-snapshot.md).
+ */
+#define EC_TACH_RPM_MULT	88
+
+/* Fan mode encoding observed in (0x01, 0x02). */
+#define EC_FAN_MODE_AUTO	0
+#define EC_FAN_MODE_MANUAL	2
 
 struct asus_ec {
 	struct device		*dev;
 	struct i2c_adapter	*adapter;
 	struct i2c_client	*ec_client;
 	struct i2c_client	*fan_client;
+	struct device		*hwmon_dev;
 	struct mutex		lock;	/* serialises EC access */
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -72,41 +95,30 @@ struct asus_ec {
 /* EC primitives — caller MUST hold ec->lock                          */
 /* ------------------------------------------------------------------ */
 
-/*
- * Raw EC register read: write [0x10, maj, min], then write [0x11], then
- * read 1 byte. Three i2c messages in one transaction.
- */
 static int __ec_rb(struct asus_ec *ec, u8 maj, u8 min, u8 *out)
 {
 	struct i2c_msg msgs[3];
+	static const u8 op_data = EC_OP_DATA;
 	int ret;
 
 	ec->tx[0] = EC_OP_ADDR;
 	ec->tx[1] = maj;
 	ec->tx[2] = min;
 
-	msgs[0].addr	= EC_I2C_ADDR;
-	msgs[0].flags	= 0;
-	msgs[0].len	= 3;
-	msgs[0].buf	= ec->tx;
+	msgs[0].addr  = EC_I2C_ADDR;
+	msgs[0].flags = 0;
+	msgs[0].len   = 3;
+	msgs[0].buf   = ec->tx;
 
-	/*
-	 * Second message reuses the next byte of tx as a 1-byte write.
-	 * Stash 0x11 separately so it doesn't clash with msg[0]'s buffer.
-	 */
-	{
-		static const u8 op_data = EC_OP_DATA;
+	msgs[1].addr  = EC_I2C_ADDR;
+	msgs[1].flags = 0;
+	msgs[1].len   = 1;
+	msgs[1].buf   = (u8 *)&op_data;
 
-		msgs[1].addr  = EC_I2C_ADDR;
-		msgs[1].flags = 0;
-		msgs[1].len   = 1;
-		msgs[1].buf   = (u8 *)&op_data;
-	}
-
-	msgs[2].addr	= EC_I2C_ADDR;
-	msgs[2].flags	= I2C_M_RD;
-	msgs[2].len	= 1;
-	msgs[2].buf	= ec->rx;
+	msgs[2].addr  = EC_I2C_ADDR;
+	msgs[2].flags = I2C_M_RD;
+	msgs[2].len   = 1;
+	msgs[2].buf   = ec->rx;
 
 	ret = i2c_transfer(ec->adapter, msgs, 3);
 	if (ret < 0) {
@@ -121,10 +133,6 @@ static int __ec_rb(struct asus_ec *ec, u8 maj, u8 min, u8 *out)
 	return 0;
 }
 
-/*
- * Raw EC register write: write [0x10, maj, min], then write [0x11, val].
- * Two i2c messages in one transaction.
- */
 static int __ec_wb(struct asus_ec *ec, u8 maj, u8 min, u8 val)
 {
 	struct i2c_msg msgs[2];
@@ -159,7 +167,6 @@ static int __ec_wb(struct asus_ec *ec, u8 maj, u8 min, u8 val)
 	return 0;
 }
 
-/* Poll (0xc4, 0x30) until it reads 0, with a hard timeout. */
 static int __ec_settle(struct asus_ec *ec)
 {
 	unsigned long deadline;
@@ -184,22 +191,14 @@ static int __ec_settle(struct asus_ec *ec)
 	}
 }
 
-/*
- * Compound read: returns the previous value of (0xc4, 0x32) AND writes
- * (0xc4, 0x32) into the target register a1/a2. The atomic-exchange
- * behaviour was confirmed during EC investigation (system-snapshot.md).
- *
- * For our purposes (reading a register without side-effects) the target
- * a1/a2 must be benign: a2 < 0x80 is safe; a2 >= 0x80 is destructive.
- */
 static int __ec_cr(struct asus_ec *ec, u8 a1, u8 a2, u8 *out)
 {
 	int ret;
 	u8 v;
 
 	if (a2 >= 0x80) {
-		dev_err(ec->dev, "eccr refused: a2=0x%02x >= 0x80 destructive\n",
-			a2);
+		dev_err(ec->dev,
+			"eccr refused: a2=0x%02x >= 0x80 destructive\n", a2);
 		return -EINVAL;
 	}
 
@@ -222,7 +221,6 @@ static int __ec_cr(struct asus_ec *ec, u8 a1, u8 a2, u8 *out)
 	if (ret)
 		return ret;
 
-	/* Clear the data mailbox so the next eccr returns a known value. */
 	ret = __ec_wb(ec, 0xc4, EC_CC_DATA, 0x00);
 	if (ret)
 		return ret;
@@ -231,11 +229,6 @@ static int __ec_cr(struct asus_ec *ec, u8 a1, u8 a2, u8 *out)
 	return 0;
 }
 
-/*
- * Compound write. Currently unused by Step 2 but kept available so
- * Step 3 (hwmon pwm1, pwm1_enable) can use it without re-touching this
- * file.
- */
 static int __maybe_unused __ec_cw(struct asus_ec *ec, u8 a1, u8 a2, u8 val)
 {
 	int ret;
@@ -257,10 +250,6 @@ static int __maybe_unused __ec_cw(struct asus_ec *ec, u8 a1, u8 a2, u8 val)
 	return __ec_settle(ec);
 }
 
-/* ------------------------------------------------------------------ */
-/* Public, locked wrappers                                            */
-/* ------------------------------------------------------------------ */
-
 static int asus_ec_read_reg(struct asus_ec *ec, u8 maj, u8 min, u8 *out)
 {
 	int ret;
@@ -272,40 +261,152 @@ static int asus_ec_read_reg(struct asus_ec *ec, u8 maj, u8 min, u8 *out)
 }
 
 /* ------------------------------------------------------------------ */
-/* sysfs: ec_battery (debug, root-only read)                          */
+/* hwmon callbacks                                                    */
 /* ------------------------------------------------------------------ */
 
-static ssize_t ec_battery_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
+static umode_t asus_ec_hwmon_is_visible(const void *drvdata,
+					enum hwmon_sensor_types type,
+					u32 attr, int channel)
+{
+	switch (type) {
+	case hwmon_fan:
+		switch (attr) {
+		case hwmon_fan_input:
+		case hwmon_fan_label:
+			return 0444;
+		default:
+			return 0;
+		}
+	case hwmon_pwm:
+		switch (attr) {
+		case hwmon_pwm_input:
+		case hwmon_pwm_enable:
+			return 0444;	/* RO in step 3, RW in step 4 */
+		default:
+			return 0;
+		}
+	case hwmon_temp:
+		switch (attr) {
+		case hwmon_temp_input:
+		case hwmon_temp_label:
+			return 0444;
+		default:
+			return 0;
+		}
+	default:
+		return 0;
+	}
+}
+
+static int asus_ec_hwmon_read(struct device *dev,
+			      enum hwmon_sensor_types type,
+			      u32 attr, int channel, long *val)
 {
 	struct asus_ec *ec = dev_get_drvdata(dev);
 	u8 v;
 	int ret;
 
-	ret = asus_ec_read_reg(ec, EC_REG_BATTERY_MAJ, EC_REG_BATTERY_MIN, &v);
-	if (ret)
-		return ret;
+	switch (type) {
+	case hwmon_fan:
+		if (attr != hwmon_fan_input)
+			return -EOPNOTSUPP;
+		ret = asus_ec_read_reg(ec, EC_REG_FAN_TACH_MAJ,
+				       EC_REG_FAN_TACH_MIN, &v);
+		if (ret)
+			return ret;
+		*val = (long)v * EC_TACH_RPM_MULT;
+		return 0;
 
-	return sysfs_emit(buf, "%u\n", v);
+	case hwmon_pwm:
+		switch (attr) {
+		case hwmon_pwm_input:
+			ret = asus_ec_read_reg(ec, EC_REG_PWM_MAJ,
+					       EC_REG_PWM_MIN, &v);
+			if (ret)
+				return ret;
+			*val = v;
+			return 0;
+		case hwmon_pwm_enable:
+			ret = asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ,
+					       EC_REG_FAN_MODE_MIN, &v);
+			if (ret)
+				return ret;
+			/* hwmon convention: 1=manual, 2=auto (matches us) */
+			if (v == EC_FAN_MODE_MANUAL)
+				*val = 1;
+			else if (v == EC_FAN_MODE_AUTO)
+				*val = 2;
+			else
+				*val = 0;	/* unknown */
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
+
+	case hwmon_temp:
+		if (attr != hwmon_temp_input)
+			return -EOPNOTSUPP;
+		ret = asus_ec_read_reg(ec, EC_REG_TEMP_MAJ,
+				       EC_REG_TEMP_MIN, &v);
+		if (ret)
+			return ret;
+		*val = (long)v * 1000;	/* °C → m°C */
+		return 0;
+
+	default:
+		return -EOPNOTSUPP;
+	}
 }
-static DEVICE_ATTR(ec_battery, 0400, ec_battery_show, NULL);
 
-static struct attribute *asus_ec_attrs[] = {
-	&dev_attr_ec_battery.attr,
-	NULL,
+static int asus_ec_hwmon_read_string(struct device *dev,
+				     enum hwmon_sensor_types type,
+				     u32 attr, int channel,
+				     const char **str)
+{
+	switch (type) {
+	case hwmon_fan:
+		if (attr == hwmon_fan_label) {
+			*str = "fan";
+			return 0;
+		}
+		break;
+	case hwmon_temp:
+		if (attr == hwmon_temp_label) {
+			*str = "ec";
+			return 0;
+		}
+		break;
+	default:
+		break;
+	}
+	return -EOPNOTSUPP;
+}
+
+static const struct hwmon_ops asus_ec_hwmon_ops = {
+	.is_visible	= asus_ec_hwmon_is_visible,
+	.read		= asus_ec_hwmon_read,
+	.read_string	= asus_ec_hwmon_read_string,
 };
-ATTRIBUTE_GROUPS(asus_ec);
+
+static const struct hwmon_channel_info * const asus_ec_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(fan,
+			   HWMON_F_INPUT | HWMON_F_LABEL),
+	HWMON_CHANNEL_INFO(pwm,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_LABEL),
+	NULL
+};
+
+static const struct hwmon_chip_info asus_ec_hwmon_chip_info = {
+	.ops	= &asus_ec_hwmon_ops,
+	.info	= asus_ec_hwmon_info,
+};
 
 /* ------------------------------------------------------------------ */
 /* Adapter discovery                                                  */
 /* ------------------------------------------------------------------ */
 
-/*
- * Locate the i2c adapter parented under the platform device named
- * EC_I2C_BUS_NAME. We don't have a DT child node for the EC (yet),
- * so we look up the platform device via its name, then resolve the
- * i2c_adapter via its OF node.
- */
 static struct i2c_adapter *asus_ec_find_adapter(struct device *dev)
 {
 	struct device *plat_dev;
@@ -353,7 +454,7 @@ static int asus_ec_probe(struct platform_device *pdev)
 	struct i2c_board_info fan_info = {
 		I2C_BOARD_INFO("asus_zenbook_a14_fan", FAN_I2C_ADDR),
 	};
-	u8 batt;
+	u8 tach, pwm, temp, mode;
 	int ret;
 
 	ec = devm_kzalloc(dev, sizeof(*ec), GFP_KERNEL);
@@ -386,17 +487,31 @@ static int asus_ec_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ec);
 
-	/* One probe read so dmesg shows we can talk to the EC. */
-	ret = asus_ec_read_reg(ec, EC_REG_BATTERY_MAJ,
-			       EC_REG_BATTERY_MIN, &batt);
-	if (ret) {
-		dev_warn(dev, "EC probe read failed: %d\n", ret);
-	} else {
-		dev_info(dev,
-			 "online: adapter=%s EC@0x%02x FAN@0x%02x battery=%u%%\n",
-			 ec->adapter->name, EC_I2C_ADDR, FAN_I2C_ADDR, batt);
+	/* Probe-time sanity reads. */
+	(void)asus_ec_read_reg(ec, EC_REG_FAN_TACH_MAJ,
+			       EC_REG_FAN_TACH_MIN, &tach);
+	(void)asus_ec_read_reg(ec, EC_REG_PWM_MAJ, EC_REG_PWM_MIN, &pwm);
+	(void)asus_ec_read_reg(ec, EC_REG_TEMP_MAJ, EC_REG_TEMP_MIN, &temp);
+	(void)asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ,
+			       EC_REG_FAN_MODE_MIN, &mode);
+
+	dev_info(dev,
+		 "online: tach=%u (~%u RPM) pwm=%u temp=%u°C mode=0x%02x\n",
+		 tach, tach * EC_TACH_RPM_MULT, pwm, temp, mode);
+
+	ec->hwmon_dev = devm_hwmon_device_register_with_info(dev,
+				DRV_NAME, ec,
+				&asus_ec_hwmon_chip_info, NULL);
+	if (IS_ERR(ec->hwmon_dev)) {
+		ret = PTR_ERR(ec->hwmon_dev);
+		dev_err(dev, "hwmon registration failed: %d\n", ret);
+		i2c_unregister_device(ec->fan_client);
+		i2c_unregister_device(ec->ec_client);
+		i2c_put_adapter(ec->adapter);
+		return ret;
 	}
 
+	dev_info(dev, "hwmon registered\n");
 	return 0;
 }
 
@@ -406,6 +521,8 @@ static void asus_ec_remove(struct platform_device *pdev)
 
 	if (!ec)
 		return;
+
+	/* hwmon_dev is devm-managed and torn down automatically. */
 
 	if (!IS_ERR_OR_NULL(ec->fan_client))
 		i2c_unregister_device(ec->fan_client);
@@ -418,9 +535,8 @@ static void asus_ec_remove(struct platform_device *pdev)
 }
 
 static struct platform_driver asus_ec_driver = {
-	.driver = {
-		.name		= DRV_NAME,
-		.dev_groups	= asus_ec_groups,
+	.driver	= {
+		.name = DRV_NAME,
 	},
 	.probe	= asus_ec_probe,
 	.remove	= asus_ec_remove,
