@@ -28,7 +28,9 @@ load:
 unload:
 	sudo rmmod asus_zenbook_a14_ec
 
-reload: unload load
+reload:
+	-sudo rmmod asus_zenbook_a14_ec 2>/dev/null
+	sudo insmod ./asus_zenbook_a14_ec.ko
 
 dmesg:
 	dmesg --ctime | grep -E 'asus_zenbook_a14_ec|asus.ec' | tail -n 40
