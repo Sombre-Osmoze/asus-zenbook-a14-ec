@@ -375,7 +375,7 @@ static int fan_send_temp_dc(struct asus_ec *ec, u16 deci_celsius)
 	return ret < 0 ? ret : 0;
 }
 
-static int fan_set_suspend(struct asus_ec *ec, u8 mode)
+static int __maybe_unused fan_set_suspend(struct asus_ec *ec, u8 mode)
 {
 	u8 buf[2] = { FAN_OP_SUSPEND, mode };
 	int ret;
@@ -633,7 +633,7 @@ static int asus_ec_watchdog_fn(void *data)
 }
 
 /* Caller MUST hold ec->mode_lock */
-static int asus_ec_start_watchdog(struct asus_ec *ec)
+static int __maybe_unused asus_ec_start_watchdog(struct asus_ec *ec)
 {
 	struct task_struct *t;
 	int ret;
@@ -1111,20 +1111,21 @@ static int __maybe_unused asus_ec_suspend(struct device *dev)
 	mutex_lock(&ec->mode_lock);
 	was_manual = ec->manual_active;
 	if (was_manual) {
-		/* Drop to auto + stop kthread before the system freezes. */
+		/* A14: no watchdog. Just set auto mode before suspend. */
 		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
 		if (ret)
 			dev_warn(dev,
 				 "suspend: failed to set auto: %d (proceeding)\n",
 				 ret);
-		asus_ec_stop_watchdog(ec);
+		/* asus_ec_stop_watchdog(ec); */
 		/* Keep manual_active=true so resume restores it. */
 	}
 	mutex_unlock(&ec->mode_lock);
 
-	ret = fan_set_suspend(ec, 0x01);
+	/* A14: no suspend mode signaling (0x23/0x76 doesn't exist). */
+	/* ret = fan_set_suspend(ec, 0x01);
 	if (ret)
-		dev_warn(dev, "suspend: fan_set_suspend(1) failed: %d\n", ret);
+		dev_warn(dev, "suspend: fan_set_suspend(1) failed: %d\n", ret); */
 
 	return 0;
 }
@@ -1134,28 +1135,20 @@ static int __maybe_unused asus_ec_resume(struct device *dev)
 	struct asus_ec *ec = dev_get_drvdata(dev);
 	int ret;
 
-	ret = fan_set_suspend(ec, 0x00);
+	/* A14: no suspend mode signaling (0x23/0x76 doesn't exist). */
+	/* ret = fan_set_suspend(ec, 0x00);
 	if (ret)
-		dev_warn(dev, "resume: fan_set_suspend(0) failed: %d\n", ret);
+		dev_warn(dev, "resume: fan_set_suspend(0) failed: %d\n", ret); */
 
 	mutex_lock(&ec->mode_lock);
 	if (ec->manual_active) {
-		/* Re-enter manual cleanly: kick watchdog + set EC mode. */
-		ret = asus_ec_start_watchdog(ec);
+		/* A14: no watchdog, just restore manual mode directly. */
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 		if (ret) {
 			dev_err(dev,
-				"resume: cannot restart watchdog (%d); leaving in auto\n",
+				"resume: cannot restore manual (%d); leaving in auto\n",
 				ret);
 			ec->manual_active = false;
-		} else {
-			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
-			if (ret) {
-				dev_err(dev,
-					"resume: cannot restore manual (%d); reverting\n",
-					ret);
-				asus_ec_stop_watchdog(ec);
-				ec->manual_active = false;
-			}
 		}
 	}
 	mutex_unlock(&ec->mode_lock);
