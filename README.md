@@ -5,26 +5,35 @@ Out-of-tree Linux kernel driver (PoC) for the Embedded Controller of the
 
 ## Status
 
-**Step 4.** Driver registers a `hwmon` device with writable PWM control,
-runs an EC-temperature watchdog kthread when in manual fan mode, and handles
-suspend/resume safely.
+**Step 4 complete.** Driver registers a `hwmon` device with **working manual PWM control**.
 
-**Profile write on A14 is disabled**: EC register `(0x01, 0x0b)` is read-only
-(firmware-controlled). Writes succeed at the I²C level but produce no state
-change. Profile likely controlled via ACPI WMI method or baked into firmware
-thermal tables. See commit `6fef937` for investigation details.
+**A14 has no watchdog timeout** (verified 2026-05-07): 3+ min manual mode with
+no temperature feed = no reboot. Watchdog kthread disabled. Manual fan control
+works via direct PWM writes — no temperature babysitting needed.
+
+**Profile write disabled**: EC register `(0x01, 0x0b)` is read-only
+(firmware-controlled). Writes succeed at I²C but produce no state change.
+Profile likely controlled via ACPI WMI or baked into firmware thermal tables.
 
 ### Exposed interfaces
 
 | sysfs                                    | semantics                              |
 |------------------------------------------|----------------------------------------|
-| `hwmon/hwmonN/fan1_input`                | RPM (tach × 88, calibrated)            |
-| `hwmon/hwmonN/pwm1`                      | 0-255 (RW; only takes effect manual)   |
-| `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW)              |
+| `hwmon/hwmonN/fan1_input`                | RPM (tach × 88, calibrated 1400-2200)  |
+| `hwmon/hwmonN/pwm1`                      | 0-255 (RW; takes effect in manual)     |
+| `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW, **works**)   |
 | `hwmon/hwmonN/temp1_input`               | EC thermistor, m°C                     |
 
-Profile sysfs (`profile` / `profile_choices`) is commented out in code;
-can be re-enabled when A14 profile-write protocol is discovered.
+**Tested end-to-end** (2026-05-07):
+```bash
+echo 1 > pwm1_enable   # manual mode
+echo 80 > pwm1         # fan → 1408 RPM
+echo 150 > pwm1        # fan → 2200 RPM (audible ramp-up)
+echo 2 > pwm1_enable   # restore auto
+```
+
+Profile sysfs (`profile` / `profile_choices`) commented out; can be re-enabled
+when A14 profile-write protocol is discovered.
 
 ## Roadmap
 
@@ -61,23 +70,20 @@ make dmesg    # tail driver log lines
 
 ## Safety
 
-- **EC watchdog**: when `pwm1_enable=1` (manual), a kthread feeds the EC
-  the max SoC thermal-zone temperature every 2s. If this stream stops
-  for ~2 minutes the EC will hard-reset the box. The driver:
-  - sends one temp synchronously **before** flipping to manual
-  - sets EC back to auto **before** stopping the kthread
-  - forces auto + stops kthread on `rmmod` and on suspend
-  - restores manual on resume only after restarting the kthread
+- **A14 has no watchdog timeout** (verified 2026-05-07: 3+ min manual mode
+  with no temp feed = no reboot). Manual PWM control is safe — no kthread,
+  no temperature babysitting. Watchdog code disabled in driver.
+- **Vivobook warning**: If porting this driver to Vivobook S15, re-enable
+  watchdog kthread (it hard-resets after ~2 min without temp feed).
 - Companion `i2c-tools` / `tool.py` user-space access on `/dev/i2c-4` is
   **mutually exclusive** with this driver — either use the userspace
   tool *or* this module, not both.
-- **Profile write disabled** on A14 — EC register is read-only. Writes
+- **Profile write disabled** on A14 — EC register read-only. Writes
   via `eccw(0x01, 0x8b, n)` succeed but produce no state change. Profile
-  appears firmware-controlled.
-- If anything misbehaves: hard power-cycle the laptop and pick the
-  working kernel from the bootloader. The module is out-of-tree and
-  never installed to `/lib/modules/.../extra/` unless you run
-  `make install` (not provided).
+  appears firmware-controlled (ACPI WMI or thermal tables).
+- If anything misbehaves: hard power-cycle and pick working kernel from
+  bootloader. Module is out-of-tree, never installed to
+  `/lib/modules/.../extra/` unless you run `make install` (not provided).
 
 ## License
 
