@@ -1,90 +1,118 @@
 # asus-zenbook-a14-ec
 
-Out-of-tree Linux kernel driver (PoC) for the Embedded Controller of the
-**ASUS Zenbook A14 (UX3407RA)**, a Qualcomm X1E80100-based laptop.
+Out-of-tree Linux kernel drivers for the **ASUS Zenbook A14 (UX3407RA)**,
+a Qualcomm X1E80100-based laptop. Provides fan control, power profiles,
+keyboard backlight, and Fn hotkeys.
+
+## Modules
+
+| Module                  | Function                                         |
+|-------------------------|--------------------------------------------------|
+| `asus_zenbook_a14_ec`   | EC hwmon (fan/PWM/temp) + platform_profile       |
+| `hid_asus_ec`           | Keyboard backlight LED class + Fn hotkeys        |
 
 ## Status
 
-**Step 4 complete.** Driver registers a `hwmon` device with **working manual PWM control**.
+### EC driver (`asus_zenbook_a14_ec`)
 
-**A14 has no watchdog timeout** (verified 2026-05-07): 3+ min manual mode with
-no temperature feed = no reboot. Watchdog kthread disabled. Manual fan control
-works via direct PWM writes — no temperature babysitting needed.
+- **hwmon**: `fan1_input`, `pwm1`, `pwm1_enable`, `temp1_input`
+- **Manual PWM**: works (no watchdog on A14 — safe indefinitely)
+- **platform_profile**: `quiet` / `balanced` / `performance`
+  - quiet/balanced → EC auto mode
+  - performance → manual PWM 180 (~2400 RPM sustained)
+  - Requires patched `platform_profile.ko` (see `patches/`)
+- **Suspend/resume**: clean, no errors
+- **Profile write disabled**: EC register `(0x01, 0x0b)` is read-only
 
-**Profile write disabled**: EC register `(0x01, 0x0b)` is read-only
-(firmware-controlled). Writes succeed at I²C but produce no state change.
-Profile likely controlled via ACPI WMI or baked into firmware thermal tables.
+### HID driver (`hid_asus_ec`)
 
-### Exposed interfaces
+- **Keyboard backlight**: LED class `asus::kbd_backlight`, 4 levels (0-3)
+- **Fn hotkeys**: Fn+F4 (backlight cycle), Fn+F5/F6 (brightness), Fn+F8
+  (emoji), Fn+F9 (micmute), Fn+F10 (camera), Fn+F11 (touchpad),
+  Fn+F12 (PROG1), Fn+F (performance)
+- **Suspend/resume**: saves/restores backlight level
+- Target device: `0B05:0220` (I2C-HID keyboard)
 
-| sysfs                                    | semantics                              |
-|------------------------------------------|----------------------------------------|
-| `hwmon/hwmonN/fan1_input`                | RPM (tach × 88, calibrated 1400-2200)  |
-| `hwmon/hwmonN/pwm1`                      | 0-255 (RW; takes effect in manual)     |
-| `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW, **works**)   |
-| `hwmon/hwmonN/temp1_input`               | EC thermistor, m°C                     |
+### PPD bridge (`scripts/ppd-bridge.py`)
 
-**Tested end-to-end** (2026-05-07):
-```bash
-echo 1 > pwm1_enable   # manual mode
-echo 80 > pwm1         # fan → 1408 RPM
-echo 150 > pwm1        # fan → 2200 RPM (audible ramp-up)
-echo 2 > pwm1_enable   # restore auto
+Temporary userspace replacement for `power-profiles-daemon`. Exposes all
+3 profiles on D-Bus so KDE Plasma's Energy Saving dropdown works. Will be
+obsoleted once the kernel `platform_profile` patch is applied and the real
+PPD detects the class device.
+
+## Kernel patch
+
+`patches/0001-platform_profile-allow-non-ACPI-systems.patch`
+
+Removes the `acpi_disabled` guard from `drivers/acpi/platform_profile.c`
+so the class device registration works on DT-only ARM64 systems. The
+legacy `/sys/firmware/acpi/platform_profile` node is skipped when
+`acpi_kobj` is NULL; the class interface
+(`/sys/class/platform-profile/platform-profile-0/`) works regardless.
+
+Apply to your kernel tree before building:
+```sh
+cd /path/to/linux
+git apply /path/to/patches/0001-platform_profile-allow-non-ACPI-systems.patch
 ```
-
-Profile sysfs (`profile` / `profile_choices`) commented out; can be re-enabled
-when A14 profile-write protocol is discovered.
-
-## Roadmap
-
-1. ✅ Scaffold (probe/remove, adapter lookup, client instantiation)
-2. ✅ EC protocol layer (`ec_settle`, `ecrb`/`ecwb`/`eccr`/`eccw`) with mutex
-3. ✅ `hwmon` registration: `fan1_input`, `pwm1`, `pwm1_enable`, `temp1`
-4. ✅ Writable PWM + temperature-watchdog kthread + suspend/resume PM ops
-5. ⏸️ Profile write — A14 EC register read-only; needs ACPI method investigation
-6. (Later) Keyboard backlight LED class — protocol cracked; integrate `hid-asus-ec` work
-7. (Later) DKMS packaging
-8. (Later) Proper DT bindings for upstream submission
 
 ## Build
 
 ```sh
-make
-```
-
-Builds against the running kernel headers
-(`/lib/modules/$(uname -r)/build`). To build against a specific tree:
-
-```sh
-make KDIR=/path/to/linux
+make                # builds both .ko against running kernel
+make KDIR=/path/to/linux   # build against specific tree
 ```
 
 ## Load / unload
 
 ```sh
-make load     # sudo insmod ./asus_zenbook_a14_ec.ko
-make unload   # sudo rmmod asus_zenbook_a14_ec
-make reload
-make dmesg    # tail driver log lines
+# EC driver (load platform_profile first if not built-in)
+sudo modprobe platform_profile
+sudo insmod ./asus_zenbook_a14_ec.ko
+
+# HID driver
+sudo insmod ./hid_asus_ec.ko
+
+# Shortcuts
+make load     # insmod EC driver
+make unload   # rmmod EC driver
+make reload   # rmmod + insmod
+make dmesg    # tail driver log
 ```
+
+## Exposed interfaces
+
+| sysfs                                    | semantics                              |
+|------------------------------------------|----------------------------------------|
+| `hwmon/hwmonN/fan1_input`                | RPM (tach × 88, calibrated 1400-2200)  |
+| `hwmon/hwmonN/pwm1`                      | 0-255 (RW; takes effect in manual)     |
+| `hwmon/hwmonN/pwm1_enable`               | 1 = manual, 2 = auto (RW)             |
+| `hwmon/hwmonN/temp1_input`               | EC thermistor, m°C                     |
+| `leds/asus::kbd_backlight/brightness`    | 0-3 (keyboard backlight)               |
+| `class/platform-profile/platform-profile-0/profile` | quiet/balanced/performance |
 
 ## Safety
 
-- **A14 has no watchdog timeout** (verified 2026-05-07: 3+ min manual mode
-  with no temp feed = no reboot). Manual PWM control is safe — no kthread,
-  no temperature babysitting. Watchdog code disabled in driver.
-- **Vivobook warning**: If porting this driver to Vivobook S15, re-enable
-  watchdog kthread (it hard-resets after ~2 min without temp feed).
-- Companion `i2c-tools` / `tool.py` user-space access on `/dev/i2c-4` is
-  **mutually exclusive** with this driver — either use the userspace
-  tool *or* this module, not both.
-- **Profile write disabled** on A14 — EC register read-only. Writes
-  via `eccw(0x01, 0x8b, n)` succeed but produce no state change. Profile
-  appears firmware-controlled (ACPI WMI or thermal tables).
+- **A14 has no watchdog timeout** (verified: 3+ min manual mode = no
+  reboot). Manual PWM control is safe without temperature babysitting.
+- **Vivobook warning**: If porting to Vivobook S15, re-enable watchdog
+  kthread (hard-resets after ~2 min without temp feed).
+- Companion `tool.py` user-space access on `/dev/i2c-4` is **mutually
+  exclusive** with this driver.
 - If anything misbehaves: hard power-cycle and pick working kernel from
-  bootloader. Module is out-of-tree, never installed to
-  `/lib/modules/.../extra/` unless you run `make install` (not provided).
+  bootloader.
+
+## Credits
+
+- **Sombre-Osmoze** <sombre@osmoze.xyz> — EC reverse-engineering, hwmon
+  driver, platform_profile integration, PPD bridge, kernel patch
+- **Alexandru Marc Serdeliuc** <serdeliuk@yahoo.com> — HID keyboard
+  backlight driver (`hid-asus-ec`), original QA work that confirmed the
+  backlight protocol on Zenbook A14
+- **icecream95** — udev-hid-bpf work on Vivobook S15/Zenbook A14,
+  early EC protocol documentation
 
 ## License
 
-GPL-2.0-only.
+GPL-2.0-only (EC driver, kernel patch).
+GPL-2.0-or-later (HID driver, per serdeliuk's original).
