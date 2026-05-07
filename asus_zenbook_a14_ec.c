@@ -673,13 +673,19 @@ static int asus_ec_enter_manual(struct asus_ec *ec)
 {
 	int ret;
 
-	ret = asus_ec_start_watchdog(ec);
+	/*
+	 * A14 has no watchdog timeout (verified 2026-05-07: 3+ min manual
+	 * mode with no temp feed = no reboot). Vivobook needs watchdog;
+	 * A14 doesn't. For now skip watchdog entirely (TODO: add model
+	 * detection and gate per-model).
+	 */
+	/* ret = asus_ec_start_watchdog(ec);
 	if (ret)
-		return ret;
+		return ret; */
 
 	ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 	if (ret) {
-		asus_ec_stop_watchdog(ec);
+		/* asus_ec_stop_watchdog(ec); */
 		return ret;
 	}
 
@@ -696,12 +702,12 @@ static int asus_ec_leave_manual(struct asus_ec *ec)
 	ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
 	if (ret) {
 		dev_err(ec->dev,
-			"failed to restore auto fan mode: %d (watchdog kept alive)\n",
-			ret);
+			"failed to restore auto fan mode: %d\n", ret);
 		return ret;
 	}
 
-	asus_ec_stop_watchdog(ec);
+	/* A14: no watchdog, nothing to stop. */
+	/* asus_ec_stop_watchdog(ec); */
 	ec->manual_active = false;
 	return 0;
 }
