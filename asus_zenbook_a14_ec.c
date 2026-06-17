@@ -2,13 +2,21 @@
 /*
  * ASUS Zenbook A14 (UX3407RA) Embedded Controller driver — PoC
  *
- * Step 5: platform_profile (low-power / balanced / performance).
+ * Step 6: dual-fan support.
  *
- *   fan1_input   eccr(0x01, 0x09) × 88        RPM (calibrated)
- *   fan1_label   "fan"
- *   pwm1         eccr(0x01, 0x0a)             0-255       (RW)
- *   pwm1_enable  eccr(0x01, 0x02) → mapped    1=manual, 2=auto (RW)
- *   temp1_input  eccr(0x05, 0x02) × 1000      m°C
+ * The A14 has two physical fans (confirmed by teardown).  The EC uses a
+ * fan-select register eccw(0x01, 0x8c, fan_id) to choose which fan
+ * subsequent PWM writes (0x8a) and tach reads (0x09/0x0a) apply to.
+ * fan_id 0 = left fan, fan_id 1 = right fan.
+ *
+ *   fan1_input   eccr(0x01, 0x09) × 88 [sel 0]  RPM (calibrated)
+ *   fan1_label   "left"
+ *   fan2_input   eccr(0x01, 0x09) × 88 [sel 1]  RPM
+ *   fan2_label   "right"
+ *   pwm1         eccr(0x01, 0x0a) [sel 0]        0-255       (RW)
+ *   pwm2         eccr(0x01, 0x0a) [sel 1]        0-255       (RW)
+ *   pwm1_enable  eccr(0x01, 0x02) → mapped       1=manual, 2=auto (RW)
+ *   temp1_input  eccr(0x05, 0x02) × 1000         m°C
  *   temp1_label  "ec"
  *
  * Manual mode is gated by the watchdog kthread: when userspace selects
@@ -79,9 +87,12 @@
 #define EC_REG_PWM_MAJ		0x01
 #define EC_REG_PWM_RMIN		0x0a	/* read:  0-255 */
 #define EC_REG_PWM_WMIN		0x8a	/* write: 0-255 */
-#define EC_REG_FAN_SEL_WMIN	0x8c	/* fan-id selector for PWM write */
+#define EC_REG_FAN_SEL_WMIN	0x8c	/* fan-id selector for PWM/tach */
 #define EC_REG_TEMP_MAJ		0x05
 #define EC_REG_TEMP_MIN		0x02	/* °C */
+
+/* A14 has two physical fans (confirmed by teardown). */
+#define EC_NUM_FANS		2
 
 /* Tach-to-RPM conversion: empirically RPM ≈ tach × 88
  * (audio FFT calibration, system-snapshot.md).
@@ -342,15 +353,42 @@ static int asus_ec_set_fan_mode(struct asus_ec *ec, u8 mode)
 				 EC_REG_FAN_MODE_WMIN, mode);
 }
 
-static int asus_ec_set_pwm(struct asus_ec *ec, u8 speed)
+static int asus_ec_set_pwm(struct asus_ec *ec, int fan_id, u8 speed)
 {
 	int ret;
 
 	mutex_lock(&ec->lock);
-	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_FAN_SEL_WMIN, 0);
+	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_FAN_SEL_WMIN, fan_id);
 	if (ret)
 		goto out;
 	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_PWM_WMIN, speed);
+out:
+	mutex_unlock(&ec->lock);
+	return ret;
+}
+
+/* Set PWM on both fans. */
+static int asus_ec_set_pwm_both(struct asus_ec *ec, u8 speed)
+{
+	int ret;
+
+	ret = asus_ec_set_pwm(ec, 0, speed);
+	if (ret)
+		return ret;
+	return asus_ec_set_pwm(ec, 1, speed);
+}
+
+/* Read tach or PWM for a specific fan. Caller selects then reads. */
+static int asus_ec_read_fan_reg(struct asus_ec *ec, int fan_id,
+				u8 reg_min, u8 *out)
+{
+	int ret;
+
+	mutex_lock(&ec->lock);
+	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_FAN_SEL_WMIN, fan_id);
+	if (ret)
+		goto out;
+	ret = __ec_cr(ec, EC_REG_FAN_TACH_MAJ, reg_min, out);
 out:
 	mutex_unlock(&ec->lock);
 	return ret;
@@ -553,7 +591,8 @@ static const struct attribute_group asus_ec_profile_group = {
  *   PERFORMANCE  → manual mode, PWM 180 (~2400 RPM sustained cooling)
  */
 
-#define PP_PERF_PWM	180
+#define PP_QUIET_PWM	80	/* ~1500 RPM — near-silent floor */
+#define PP_PERF_PWM	180	/* ~2400 RPM — sustained cooling */
 
 static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
 {
@@ -582,8 +621,20 @@ static int asus_ec_pp_set(struct device *dev,
 
 	switch (profile) {
 	case PLATFORM_PROFILE_QUIET:
+		/* Manual mode with low PWM — near-silent operation. */
+		if (!ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+			if (ret)
+				goto out;
+			ec->manual_active = true;
+		}
+		ret = asus_ec_set_pwm_both(ec, PP_QUIET_PWM);
+		if (ret)
+			goto out;
+		break;
+
 	case PLATFORM_PROFILE_BALANCED:
-		/* Both use auto mode — EC handles the thermal curve. */
+		/* Auto mode — EC handles the thermal curve. */
 		if (ec->manual_active) {
 			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
 			if (ret)
@@ -593,14 +644,14 @@ static int asus_ec_pp_set(struct device *dev,
 		break;
 
 	case PLATFORM_PROFILE_PERFORMANCE:
-		/* Manual mode with fixed high PWM for sustained cooling. */
+		/* Manual mode with high PWM for sustained cooling. */
 		if (!ec->manual_active) {
 			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 			if (ret)
 				goto out;
 			ec->manual_active = true;
 		}
-		ret = asus_ec_set_pwm(ec, PP_PERF_PWM);
+		ret = asus_ec_set_pwm_both(ec, PP_PERF_PWM);
 		if (ret)
 			goto out;
 		break;
@@ -809,6 +860,8 @@ static umode_t asus_ec_hwmon_is_visible(const void *drvdata,
 {
 	switch (type) {
 	case hwmon_fan:
+		if (channel >= EC_NUM_FANS)
+			return 0;
 		switch (attr) {
 		case hwmon_fan_input:
 		case hwmon_fan_label:
@@ -817,10 +870,14 @@ static umode_t asus_ec_hwmon_is_visible(const void *drvdata,
 			return 0;
 		}
 	case hwmon_pwm:
+		if (channel >= EC_NUM_FANS)
+			return 0;
 		switch (attr) {
 		case hwmon_pwm_input:
-		case hwmon_pwm_enable:
 			return 0644;
+		case hwmon_pwm_enable:
+			/* Mode is global; only expose on channel 0 */
+			return channel == 0 ? 0644 : 0;
 		default:
 			return 0;
 		}
@@ -847,10 +904,10 @@ static int asus_ec_hwmon_read(struct device *dev,
 
 	switch (type) {
 	case hwmon_fan:
-		if (attr != hwmon_fan_input)
+		if (attr != hwmon_fan_input || channel >= EC_NUM_FANS)
 			return -EOPNOTSUPP;
-		ret = asus_ec_read_reg(ec, EC_REG_FAN_TACH_MAJ,
-				       EC_REG_FAN_TACH_MIN, &v);
+		ret = asus_ec_read_fan_reg(ec, channel,
+					   EC_REG_FAN_TACH_MIN, &v);
 		if (ret)
 			return ret;
 		*val = (long)v * EC_TACH_RPM_MULT;
@@ -859,13 +916,18 @@ static int asus_ec_hwmon_read(struct device *dev,
 	case hwmon_pwm:
 		switch (attr) {
 		case hwmon_pwm_input:
-			ret = asus_ec_read_reg(ec, EC_REG_PWM_MAJ,
-					       EC_REG_PWM_RMIN, &v);
+			if (channel >= EC_NUM_FANS)
+				return -EOPNOTSUPP;
+			ret = asus_ec_read_fan_reg(ec, channel,
+						   EC_REG_PWM_RMIN, &v);
 			if (ret)
 				return ret;
 			*val = v;
 			return 0;
 		case hwmon_pwm_enable:
+			/* Mode is global, only on channel 0 */
+			if (channel != 0)
+				return -EOPNOTSUPP;
 			ret = asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ,
 					       EC_REG_FAN_MODE_RMIN, &v);
 			if (ret)
@@ -933,6 +995,8 @@ static int asus_ec_hwmon_write(struct device *dev,
 	case hwmon_pwm_input:
 		if (val < 0 || val > 255)
 			return -EINVAL;
+		if (channel >= EC_NUM_FANS)
+			return -EOPNOTSUPP;
 		speed = (u8)val;
 
 		mutex_lock(&ec->mode_lock);
@@ -940,21 +1004,23 @@ static int asus_ec_hwmon_write(struct device *dev,
 			mutex_unlock(&ec->mode_lock);
 			return -EBUSY;	/* set pwm1_enable=1 first */
 		}
-		ret = asus_ec_set_pwm(ec, speed);
+		ret = asus_ec_set_pwm(ec, channel, speed);
 		mutex_unlock(&ec->mode_lock);
 		if (ret)
 			return ret;
 
 		if (speed > 0 && speed < EC_PWM_SPIN_FLOOR)
 			dev_info_ratelimited(ec->dev,
-				"pwm=%u below spin floor (%u); fan likely idle\n",
-				speed, EC_PWM_SPIN_FLOOR);
+				"fan%d pwm=%u below spin floor (%u); fan likely idle\n",
+				channel, speed, EC_PWM_SPIN_FLOOR);
 		return 0;
 
 	default:
 		return -EOPNOTSUPP;
 	}
 }
+
+static const char * const fan_labels[] = { "left", "right" };
 
 static int asus_ec_hwmon_read_string(struct device *dev,
 				     enum hwmon_sensor_types type,
@@ -963,8 +1029,8 @@ static int asus_ec_hwmon_read_string(struct device *dev,
 {
 	switch (type) {
 	case hwmon_fan:
-		if (attr == hwmon_fan_label) {
-			*str = "fan";
+		if (attr == hwmon_fan_label && channel < EC_NUM_FANS) {
+			*str = fan_labels[channel];
 			return 0;
 		}
 		break;
@@ -989,9 +1055,11 @@ static const struct hwmon_ops asus_ec_hwmon_ops = {
 
 static const struct hwmon_channel_info * const asus_ec_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(fan,
+			   HWMON_F_INPUT | HWMON_F_LABEL,
 			   HWMON_F_INPUT | HWMON_F_LABEL),
 	HWMON_CHANNEL_INFO(pwm,
-			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT),
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL
@@ -1050,10 +1118,7 @@ static int asus_ec_probe(struct platform_device *pdev)
 	struct i2c_board_info ec_info = {
 		I2C_BOARD_INFO("asus_zenbook_a14_ec", EC_I2C_ADDR),
 	};
-	struct i2c_board_info fan_info = {
-		I2C_BOARD_INFO("asus_zenbook_a14_fan", FAN_I2C_ADDR),
-	};
-	u8 tach, pwm, temp, mode;
+	u8 temp, mode;
 	int ret;
 
 	ec = devm_kzalloc(dev, sizeof(*ec), GFP_KERNEL);
@@ -1076,35 +1141,44 @@ static int asus_ec_probe(struct platform_device *pdev)
 		return PTR_ERR(ec->ec_client);
 	}
 
-	ec->fan_client = i2c_new_client_device(ec->adapter, &fan_info);
-	if (IS_ERR(ec->fan_client)) {
-		dev_err(dev, "failed to register FAN client at 0x%02x\n",
-			FAN_I2C_ADDR);
-		i2c_unregister_device(ec->ec_client);
-		i2c_put_adapter(ec->adapter);
-		return PTR_ERR(ec->fan_client);
-	}
+	/*
+	 * A14 has no fan controller IC at 0x76 — skip registration.
+	 * Vivobook S15 needs this; A14 fan control is entirely via the
+	 * EC at 0x5b (eccw 0x01,0x82/0x8a).  Registering a client on a
+	 * non-existent address causes spurious I2C NAKs and may disturb
+	 * the EC's idle fan behaviour.
+	 */
+	ec->fan_client = NULL;
 
 	platform_set_drvdata(pdev, ec);
 
 	asus_ec_lookup_thermal_zones(ec);
 
 	/* Probe-time sanity reads. */
-	(void)asus_ec_read_reg(ec, EC_REG_FAN_TACH_MAJ,
-			       EC_REG_FAN_TACH_MIN, &tach);
-	(void)asus_ec_read_reg(ec, EC_REG_PWM_MAJ, EC_REG_PWM_RMIN, &pwm);
-	(void)asus_ec_read_reg(ec, EC_REG_TEMP_MAJ, EC_REG_TEMP_MIN, &temp);
-	(void)asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ,
-			       EC_REG_FAN_MODE_RMIN, &mode);
+	{
+		u8 tach0, tach1, pwm0, pwm1;
 
-	dev_info(dev,
-		 "online: tach=%u (~%u RPM) pwm=%u temp=%u°C mode=0x%02x zones=%d\n",
-		 tach, tach * EC_TACH_RPM_MULT, pwm, temp, mode, ec->n_zones);
+		(void)asus_ec_read_fan_reg(ec, 0, EC_REG_FAN_TACH_MIN, &tach0);
+		(void)asus_ec_read_fan_reg(ec, 1, EC_REG_FAN_TACH_MIN, &tach1);
+		(void)asus_ec_read_fan_reg(ec, 0, EC_REG_PWM_RMIN, &pwm0);
+		(void)asus_ec_read_fan_reg(ec, 1, EC_REG_PWM_RMIN, &pwm1);
+		(void)asus_ec_read_reg(ec, EC_REG_TEMP_MAJ, EC_REG_TEMP_MIN, &temp);
+		(void)asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ,
+				       EC_REG_FAN_MODE_RMIN, &mode);
+
+		dev_info(dev,
+			 "online: fan0 tach=%u (~%u RPM) pwm=%u | fan1 tach=%u (~%u RPM) pwm=%u | temp=%u°C mode=0x%02x zones=%d\n",
+			 tach0, tach0 * EC_TACH_RPM_MULT, pwm0,
+			 tach1, tach1 * EC_TACH_RPM_MULT, pwm1,
+			 temp, mode, ec->n_zones);
+	}
 
 	if (mode == EC_FAN_MODE_MANUAL) {
 		dev_warn(dev,
 			 "EC found in MANUAL mode at probe; forcing AUTO for safety\n");
 		(void)asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
+	} else {
+		dev_info(dev, "EC already in AUTO mode; not poking fan controller\n");
 	}
 
 	ec->hwmon_dev = devm_hwmon_device_register_with_info(dev,
@@ -1113,7 +1187,6 @@ static int asus_ec_probe(struct platform_device *pdev)
 	if (IS_ERR(ec->hwmon_dev)) {
 		ret = PTR_ERR(ec->hwmon_dev);
 		dev_err(dev, "hwmon registration failed: %d\n", ret);
-		i2c_unregister_device(ec->fan_client);
 		i2c_unregister_device(ec->ec_client);
 		i2c_put_adapter(ec->adapter);
 		return ret;
@@ -1206,27 +1279,25 @@ static void asus_ec_remove(struct platform_device *pdev)
 static int __maybe_unused asus_ec_suspend(struct device *dev)
 {
 	struct asus_ec *ec = dev_get_drvdata(dev);
-	bool was_manual;
 	int ret;
 
 	mutex_lock(&ec->mode_lock);
-	was_manual = ec->manual_active;
-	if (was_manual) {
-		/* A14: no watchdog. Just set auto mode before suspend. */
-		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
-		if (ret)
-			dev_warn(dev,
-				 "suspend: failed to set auto: %d (proceeding)\n",
-				 ret);
-		/* asus_ec_stop_watchdog(ec); */
-		/* Keep manual_active=true so resume restores it. */
-	}
-	mutex_unlock(&ec->mode_lock);
 
-	/* A14: no suspend mode signaling (0x23/0x76 doesn't exist). */
-	/* ret = fan_set_suspend(ec, 0x01);
+	/*
+	 * Force fan off during suspend: switch to manual mode and set
+	 * PWM to 0 on BOTH fans. The EC on A14 has no suspend signaling
+	 * (0x23/0x76 doesn't exist), so it would otherwise keep the fans
+	 * spinning at whatever auto-mode decided pre-suspend.
+	 */
+	ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 	if (ret)
-		dev_warn(dev, "suspend: fan_set_suspend(1) failed: %d\n", ret); */
+		dev_warn(dev, "suspend: set manual failed: %d\n", ret);
+
+	ret = asus_ec_set_pwm_both(ec, 0);
+	if (ret)
+		dev_warn(dev, "suspend: set pwm 0 (both fans) failed: %d\n", ret);
+
+	mutex_unlock(&ec->mode_lock);
 
 	return 0;
 }
@@ -1236,22 +1307,42 @@ static int __maybe_unused asus_ec_resume(struct device *dev)
 	struct asus_ec *ec = dev_get_drvdata(dev);
 	int ret;
 
-	/* A14: no suspend mode signaling (0x23/0x76 doesn't exist). */
-	/* ret = fan_set_suspend(ec, 0x00);
-	if (ret)
-		dev_warn(dev, "resume: fan_set_suspend(0) failed: %d\n", ret); */
-
 	mutex_lock(&ec->mode_lock);
-	if (ec->manual_active) {
-		/* A14: no watchdog, just restore manual mode directly. */
+
+	/*
+	 * Restore the pre-suspend profile state (both fans):
+	 *   quiet       → manual + PP_QUIET_PWM
+	 *   balanced    → auto mode
+	 *   performance → manual + PP_PERF_PWM
+	 */
+	switch (ec->pp_active) {
+	case PLATFORM_PROFILE_QUIET:
 		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
-		if (ret) {
-			dev_err(dev,
-				"resume: cannot restore manual (%d); leaving in auto\n",
-				ret);
-			ec->manual_active = false;
-		}
+		if (!ret)
+			ret = asus_ec_set_pwm_both(ec, PP_QUIET_PWM);
+		if (ret)
+			dev_warn(dev, "resume: restore quiet failed: %d\n", ret);
+		ec->manual_active = true;
+		break;
+
+	case PLATFORM_PROFILE_PERFORMANCE:
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+		if (!ret)
+			ret = asus_ec_set_pwm_both(ec, PP_PERF_PWM);
+		if (ret)
+			dev_warn(dev, "resume: restore perf failed: %d\n", ret);
+		ec->manual_active = true;
+		break;
+
+	default:
+		/* balanced / unknown → auto */
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
+		if (ret)
+			dev_warn(dev, "resume: restore auto failed: %d\n", ret);
+		ec->manual_active = false;
+		break;
 	}
+
 	mutex_unlock(&ec->mode_lock);
 
 	return 0;
