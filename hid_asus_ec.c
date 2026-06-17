@@ -126,55 +126,8 @@ static int asus_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 				asus_kbd_set_brightness(&data->kbd_led_cdev,
 							(enum led_brightness)next_level);
-				if (next_level > current_level ||
-				    (current_level == max_level && next_level == 0)) {
-					if (next_level == 0) {
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-					} else {
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMUP, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMUP, 0);
-						input_sync(input_dev);
-					}
-				} else if (next_level < current_level) {
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-				}
+				led_classdev_notify_brightness_hw_changed(
+					&data->kbd_led_cdev, next_level);
 			}
 			return 1;
 		case A14_EC_EVT_KEY_FN_F5:
@@ -291,6 +244,78 @@ static int asus_hid_resume(struct hid_device *hdev)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Debug sysfs: send/recv arbitrary 0x5A commands for reverse-engineering */
+/* ------------------------------------------------------------------ */
+
+static u8 debug_response[A14_EC_REPORT_SIZE];
+
+/*
+ * Write: hex string of up to 63 data bytes (report ID 0x5A is prepended).
+ * Example: echo "75 02" > /sys/.../hid_cmd → sends [0x5A, 0x75, 0x02, 0...]
+ * Read:  returns the GET_FEATURE response after the last SET.
+ */
+static ssize_t hid_cmd_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	u8 cmd[A14_EC_REPORT_SIZE] = { A14_EC_REPORT_ID };
+	u8 resp[A14_EC_REPORT_SIZE] = { A14_EC_REPORT_ID };
+	int i = 0, ret;
+	const char *p = buf;
+
+	while (*p && i < A14_EC_REPORT_SIZE - 1) {
+		unsigned int val;
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		if (sscanf(p, "%x", &val) != 1)
+			break;
+		cmd[1 + i++] = (u8)val;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+			p++;
+	}
+
+	if (i == 0)
+		return -EINVAL;
+
+	ret = hid_hw_raw_request(hdev, A14_EC_REPORT_ID, cmd,
+				 A14_EC_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_SET_REPORT);
+	if (ret < 0) {
+		dev_err(dev, "hid_cmd SET failed: %d\n", ret);
+		return ret;
+	}
+
+	msleep(50);
+
+	ret = hid_hw_raw_request(hdev, A14_EC_REPORT_ID, resp,
+				 A14_EC_REPORT_SIZE, HID_FEATURE_REPORT,
+				 HID_REQ_GET_REPORT);
+	if (ret < 0) {
+		dev_warn(dev, "hid_cmd GET failed: %d\n", ret);
+		memset(debug_response, 0, sizeof(debug_response));
+	} else {
+		memcpy(debug_response, resp, A14_EC_REPORT_SIZE);
+	}
+
+	return count;
+}
+
+static ssize_t hid_cmd_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	int i, len = 0;
+
+	for (i = 0; i < A14_EC_REPORT_SIZE; i++)
+		len += sysfs_emit_at(buf, len, "%02x ", debug_response[i]);
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static DEVICE_ATTR_RW(hid_cmd);
+
 static const struct hid_device_id asus_hid_devices[] = {
 	/* Tested on ASUS Zenbook A14 (UX3407QA) only. */
 	{ HID_DEVICE(0x18, 0x00, ASUS_VENDOR_ID, ASUS_PRODUCT_ID) },
@@ -351,6 +376,7 @@ static int asus_hid_probe(struct hid_device *hdev, const struct hid_device_id *i
 	data->kbd_led_cdev.name = "asus::kbd_backlight";
 	data->kbd_led_cdev.brightness_set = asus_kbd_set_brightness;
 	data->kbd_led_cdev.max_brightness = A14_EC_MAX_BACKLIGHT;
+	data->kbd_led_cdev.flags = LED_BRIGHT_HW_CHANGED;
 	ret = led_classdev_register(&hdev->dev, &data->kbd_led_cdev);
 	if (ret) {
 		input_unregister_device(data->hotkey_input_dev);
@@ -360,12 +386,16 @@ static int asus_hid_probe(struct hid_device *hdev, const struct hid_device_id *i
 	dev_info(&hdev->dev,
 		 "ASUS EC HID driver for Zenbook A14 loaded for 0x%04x:0x%04x\n",
 		 ASUS_VENDOR_ID, ASUS_PRODUCT_ID);
+
+	device_create_file(&hdev->dev, &dev_attr_hid_cmd);
+
 	return 0;
 }
 static void asus_hid_remove(struct hid_device *hdev)
 {
 	struct asus_hid_data *data = hid_get_drvdata(hdev);
 
+	device_remove_file(&hdev->dev, &dev_attr_hid_cmd);
 	led_classdev_unregister(&data->kbd_led_cdev);
 	input_unregister_device(data->hotkey_input_dev);
 	hid_hw_stop(hdev);
