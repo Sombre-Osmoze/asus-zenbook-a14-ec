@@ -44,6 +44,7 @@
  * Copyright (C) 2026 Sombre-Osmoze <sombre@osmoze.xyz>
  */
 
+#include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
@@ -57,6 +58,7 @@
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/pm.h>
+#include <linux/pm_qos.h>
 #include <linux/sched.h>
 #include <linux/thermal.h>
 
@@ -128,6 +130,11 @@
 /* Watchdog: must be well below the EC's ~2 min timeout. */
 #define WATCHDOG_PERIOD_MS	2000
 
+/* CPU frequency capping for quiet profile (kHz). */
+#define PP_QUIET_FREQ_KHZ	1440000	/* 1.44 GHz — enough for TS/browsing */
+#define PP_MAX_FREQ_KHZ		3417600	/* uncapped (full boost) */
+#define PP_MAX_POLICIES		4	/* X1E: 3 clusters, room for 4 */
+
 /* Thermal zones to feed to the EC (max of). */
 #define ASUS_EC_MAX_ZONES	4
 static const char * const asus_ec_thermal_zones[] = {
@@ -160,6 +167,10 @@ struct asus_ec {
 	u8			profile_cached;	/* last value we wrote */
 	struct device		*ppdev;		/* platform_profile class device */
 	enum platform_profile_option pp_active;	/* currently active profile */
+
+	/* CPU frequency QoS — one max-freq request per cpufreq policy */
+	struct freq_qos_request	freq_req[PP_MAX_POLICIES];
+	int			n_freq_req;
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -579,19 +590,90 @@ static const struct attribute_group asus_ec_profile_group = {
 };
 
 /* ------------------------------------------------------------------ */
+/* CPU frequency QoS                                                  */
+/* ------------------------------------------------------------------ */
+
+static void asus_ec_freq_qos_init(struct asus_ec *ec)
+{
+	struct cpufreq_policy *policy;
+	int cpu, ret;
+
+	ec->n_freq_req = 0;
+
+	for_each_possible_cpu(cpu) {
+		if (ec->n_freq_req >= PP_MAX_POLICIES)
+			break;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		/* Skip if we already registered for this policy (shared). */
+		if (cpu != cpumask_first(policy->related_cpus)) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		ret = freq_qos_add_request(&policy->constraints,
+					   &ec->freq_req[ec->n_freq_req],
+					   FREQ_QOS_MAX,
+					   PP_MAX_FREQ_KHZ);
+		cpufreq_cpu_put(policy);
+
+		if (ret < 0) {
+			dev_warn(ec->dev,
+				 "freq_qos: failed to add request for cpu%d: %d\n",
+				 cpu, ret);
+			continue;
+		}
+
+		ec->n_freq_req++;
+	}
+
+	dev_info(ec->dev, "freq_qos: %d policies registered\n",
+		 ec->n_freq_req);
+}
+
+static void asus_ec_freq_qos_cleanup(struct asus_ec *ec)
+{
+	int i;
+
+	for (i = 0; i < ec->n_freq_req; i++)
+		freq_qos_remove_request(&ec->freq_req[i]);
+	ec->n_freq_req = 0;
+}
+
+static int asus_ec_freq_qos_set(struct asus_ec *ec, s32 max_khz)
+{
+	int i, ret;
+
+	for (i = 0; i < ec->n_freq_req; i++) {
+		ret = freq_qos_update_request(&ec->freq_req[i], max_khz);
+		if (ret < 0) {
+			dev_warn(ec->dev,
+				 "freq_qos: update %d to %d kHz failed: %d\n",
+				 i, max_khz, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* platform_profile integration                                       */
 /* ------------------------------------------------------------------ */
 
 /*
  * Since the A14 EC profile register (0x01,0x0b) is read-only and the
  * Vivobook protocol (0x24/0x76) NACKs, we implement platform_profile
- * by controlling the fan directly:
- *   QUIET        → auto mode (EC manages conservatively)
- *   BALANCED     → auto mode (EC default thermal curve)
- *   PERFORMANCE  → manual mode, PWM 180 (~2400 RPM sustained cooling)
+ * by controlling the fan + CPU frequency directly:
+ *   QUIET        → manual PWM 0 (fans off) + CPU capped to 1.44 GHz
+ *   BALANCED     → auto mode (EC thermal curve) + CPU uncapped
+ *   PERFORMANCE  → manual PWM 180 (~2400 RPM) + CPU uncapped
  */
 
-#define PP_QUIET_PWM	80	/* ~1500 RPM — near-silent floor */
+#define PP_QUIET_PWM	0	/* fans off — passive cooling at capped freq */
 #define PP_PERF_PWM	180	/* ~2400 RPM — sustained cooling */
 
 static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
@@ -621,7 +703,7 @@ static int asus_ec_pp_set(struct device *dev,
 
 	switch (profile) {
 	case PLATFORM_PROFILE_QUIET:
-		/* Manual mode with low PWM — near-silent operation. */
+		/* Manual mode with low PWM + CPU freq cap. */
 		if (!ec->manual_active) {
 			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 			if (ret)
@@ -631,20 +713,22 @@ static int asus_ec_pp_set(struct device *dev,
 		ret = asus_ec_set_pwm_both(ec, PP_QUIET_PWM);
 		if (ret)
 			goto out;
+		asus_ec_freq_qos_set(ec, PP_QUIET_FREQ_KHZ);
 		break;
 
 	case PLATFORM_PROFILE_BALANCED:
-		/* Auto mode — EC handles the thermal curve. */
+		/* Auto mode — EC handles the thermal curve. CPU uncapped. */
 		if (ec->manual_active) {
 			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
 			if (ret)
 				goto out;
 			ec->manual_active = false;
 		}
+		asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
 		break;
 
 	case PLATFORM_PROFILE_PERFORMANCE:
-		/* Manual mode with high PWM for sustained cooling. */
+		/* Manual mode with high PWM for sustained cooling. CPU uncapped. */
 		if (!ec->manual_active) {
 			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
 			if (ret)
@@ -654,6 +738,7 @@ static int asus_ec_pp_set(struct device *dev,
 		ret = asus_ec_set_pwm_both(ec, PP_PERF_PWM);
 		if (ret)
 			goto out;
+		asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
 		break;
 
 	default:
@@ -1228,7 +1313,7 @@ static int asus_ec_probe(struct platform_device *pdev)
 			 profile_names[ec->profile_cached]);
 	*/
 
-	/* Register platform_profile — maps profiles to fan PWM control.
+	/* Register platform_profile — maps profiles to fan PWM + CPU freq.
 	 * PPD will auto-discover via /sys/class/platform-profile/.
 	 */
 	ec->pp_active = PLATFORM_PROFILE_BALANCED;
@@ -1241,6 +1326,9 @@ static int asus_ec_probe(struct platform_device *pdev)
 	} else {
 		dev_info(dev, "platform_profile registered (quiet/balanced/performance)\n");
 	}
+
+	/* Set up CPU freq QoS for profile-based frequency capping. */
+	asus_ec_freq_qos_init(ec);
 
 	return 0;
 }
@@ -1259,6 +1347,10 @@ static void asus_ec_remove(struct platform_device *pdev)
 	else
 		asus_ec_stop_watchdog(ec);
 	mutex_unlock(&ec->mode_lock);
+
+	/* Restore CPU freq to uncapped before removing. */
+	asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
+	asus_ec_freq_qos_cleanup(ec);
 
 	/* hwmon_dev is devm-managed and torn down automatically. */
 
